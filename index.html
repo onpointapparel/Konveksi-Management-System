@@ -1389,6 +1389,7 @@
             </div>
             <form onsubmit="handleSaveStock(event)" class="p-5 space-y-4 text-xs">
                 <input type="hidden" id="stk-type" value="Kain">
+                <input type="hidden" id="stk-id" value="">
                 
                 <div>
                     <label class="font-semibold text-slate-600 block mb-1" id="stk-label-name">Nama Barang / Spesifikasi</label>
@@ -1887,42 +1888,60 @@
             }
 
             if (action === 'bootstrap') {
-                const profile = await getCurrentProfile(appData.role);
-                const results = await Promise.all([
-                    supabaseClient.from('orders').select('*').order('created_at', { ascending: false }),
-                    supabaseClient.from('order_items').select('*'),
-                    supabaseClient.from('payments').select('*'),
-                    supabaseClient.from('customers').select('*').order('created_at', { ascending: false }),
-                    supabaseClient.from('expenses').select('*').order('date', { ascending: false }),
-                    supabaseClient.from('stock').select('*'),
-                    supabaseClient.from('defects').select('*').order('created_at', { ascending: false })
-                ]);
-                const labels = ['orders','order_items','payments','customers','expenses','stock','defects'];
-                results.forEach((r,i) => { if (r.error) throw sbError(r.error, `Gagal memuat ${labels[i]}.`); });
-                const [orders, items, payments, customers, expenses, stock, defects] = results.map(r => r.data || []);
+                const role = String(appData.role || '').toLowerCase();
+                await getCurrentProfile(role);
+                if (!['owner','cs','produksi'].includes(role)) throw new Error('Role tidak memiliki akses aplikasi.');
 
-                // Periode keuangan harus disimpan bersama di Supabase, bukan hanya LocalStorage.
-                const { data: financeSetting, error: financeSettingError } = await supabaseClient
-                    .from('settings').select('value').eq('key', 'finance_periods_v1').maybeSingle();
-                if (financeSettingError) throw sbError(financeSettingError, 'Gagal memuat periode keuangan bersama dari Supabase.');
+                // Ambil hanya tabel yang dibutuhkan oleh role aktif. Jangan meminta
+                // tabel keuangan/settings dari sesi Produksi.
+                const requests = [
+                    ['orders', supabaseClient.from('orders').select('*').order('created_at', { ascending: false })],
+                    ['order_items', supabaseClient.from('order_items').select('*')],
+                    ['payments', ['owner','cs'].includes(role) ? supabaseClient.from('payments').select('*') : Promise.resolve({data:[],error:null})],
+                    ['customers', ['owner','cs'].includes(role) ? supabaseClient.from('customers').select('*').order('created_at', { ascending: false }) : Promise.resolve({data:[],error:null})],
+                    ['expenses', role === 'owner' ? supabaseClient.from('expenses').select('*').order('date', { ascending: false }) : Promise.resolve({data:[],error:null})],
+                    ['stock', ['owner','produksi'].includes(role) ? supabaseClient.from('stock').select('*') : Promise.resolve({data:[],error:null})],
+                    ['defects', supabaseClient.from('defects').select('*').order('created_at', { ascending: false })]
+                ];
+                const results = await Promise.all(requests.map(x => x[1]));
+                results.forEach((r,i) => { if (r.error) throw sbError(r.error, `Gagal memuat ${requests[i][0]}.`); });
+                const data = Object.fromEntries(requests.map((x,i) => [x[0], results[i].data || []]));
                 let financePeriods = [];
-                if (financeSetting?.value) {
-                    try {
-                        const parsedPeriods = JSON.parse(financeSetting.value);
-                        financePeriods = Array.isArray(parsedPeriods) ? parsedPeriods : [];
-                    } catch (_) {
-                        throw new Error('Data periode keuangan di Supabase tidak valid (format JSON).');
+                if (role === 'owner') {
+                    const { data: financeSetting, error: financeSettingError } = await supabaseClient
+                        .from('settings').select('value').eq('key', 'finance_periods_v1').maybeSingle();
+                    if (financeSettingError) throw sbError(financeSettingError, 'Gagal memuat periode keuangan bersama dari Supabase.');
+                    if (financeSetting?.value) {
+                        try {
+                            const parsedPeriods = JSON.parse(financeSetting.value);
+                            financePeriods = Array.isArray(parsedPeriods) ? parsedPeriods : [];
+                        } catch (_) { throw new Error('Data periode keuangan di Supabase tidak valid (format JSON).'); }
                     }
                 }
                 return { ok: true, data: {
                     financePeriods,
-                    orders: orders.map(o => normalizeOrderFromSupabase(o, items, payments)),
-                    payments,
-                    customers,
-                    expenses: expenses.map(x => ({ id:x.expense_id, date:x.date, category:x.category, desc:x.description, amount:Number(x.amount||0), createdBy:x.created_by||'', status:x.status||'Approved' })),
-                    stock: stock.map(x => ({ id:x.stock_id, type:x.type, name:x.name, qty:Number(x.qty||0), unit:x.unit||'', minQty:Number(x.min_qty||0), supplier:x.supplier||'', note:x.note||'' })),
-                    defects: defects.map(x => ({ id:x.defect_id, orderId:x.order_id||'', date:x.date||x.created_at||'', division:x.type||'', defectType:x.type||'', qty:Number(x.qty||0), action:x.description||'', status:x.status||'Open' }))
+                    orders: data.orders.map(o => normalizeOrderFromSupabase(o, data.order_items, data.payments)),
+                    payments: data.payments,
+                    customers: data.customers,
+                    expenses: data.expenses.map(x => ({ id:x.expense_id, date:x.date, category:x.category, desc:x.description, amount:Number(x.amount||0), createdBy:x.created_by||'', status:x.status||'Approved' })),
+                    stock: data.stock.map(x => ({ id:x.stock_id, type:x.type, name:x.name, qty:Number(x.qty||0), unit:x.unit||'', minQty:Number(x.min_qty||0), supplier:x.supplier||'', note:x.note||'' })),
+                    defects: data.defects.map(x => ({ id:x.defect_id, orderId:x.order_id||'', date:x.date||x.created_at||'', division:x.division||x.type||'', defectType:x.type||'', qty:Number(x.qty||0), action:x.description||'', status:x.status||'Open' }))
                 }, config: {} };
+            }
+
+            if (action === 'updateProductionStatus') {
+                const role = String(appData.role || '').toLowerCase();
+                const orderId = String(payload.orderId || '');
+                const status = String(payload.status || '');
+                const allowed = ['Antrian','Potong Kain','Sablon / Bordir','Proses Jahit','QC & Packing','Selesai / Lunas'];
+                if (!['owner','cs','produksi'].includes(role)) throw new Error('Role tidak diizinkan mengubah status order.');
+                if (!orderId || !allowed.includes(status)) throw new Error('Order atau status tidak valid.');
+                const { data, error } = await supabaseClient.from('orders')
+                    .update({ status, updated_at:new Date().toISOString() })
+                    .eq('order_id', orderId).select('order_id,status,updated_at').maybeSingle();
+                if (error) throw sbError(error, 'Gagal memperbarui status produksi.');
+                if (!data) throw new Error('Order tidak ditemukan atau perubahan ditolak database/RLS.');
+                return { ok:true, data };
             }
 
             if (action === 'updateDesignStatus') {
@@ -2274,7 +2293,7 @@
                 // agar periode lama dari perangkat asal tersedia di semua perangkat.
                 const cloudSnapshot = JSON.stringify(cloudFinancePeriods.slice().sort((a,b) => String(a?.startDate || '').localeCompare(String(b?.startDate || ''))));
                 const mergedSnapshot = JSON.stringify(mergedFinancePeriods);
-                if (mergedSnapshot !== cloudSnapshot && mergedFinancePeriods.length) {
+                if (String(appData.role || '').toLowerCase() === 'owner' && mergedSnapshot !== cloudSnapshot && mergedFinancePeriods.length) {
                     await cloudRequest('saveFinancePeriods', { periods: mergedFinancePeriods });
                 }
 
@@ -2640,6 +2659,7 @@
                     { id: 'cs-workspace', label: 'CS Workspace', icon: 'fa-house' },
                     { id: 'design-center', label: 'Design Center', icon: 'fa-palette' },
                     { id: 'daftar-pesanan', label: 'Status Order', icon: 'fa-list-check' },
+                    { id: 'produksi-kanban', label: 'Laporan Defect', icon: 'fa-bug' },
                     { id: 'crm', label: 'Data Customer', icon: 'fa-address-book' }
                 ];
                 document.querySelectorAll('.owner-only').forEach(el => el.classList.add('hidden'));
@@ -2666,6 +2686,16 @@
                 `;
             });
 
+            if (appData.role === 'cs') {
+                const board = document.getElementById('kanban-board-container');
+                if (board) board.classList.add('hidden');
+                const defectAction = document.querySelector('#view-produksi-kanban > div:first-child button');
+                if (defectAction) defectAction.classList.add('hidden');
+                const heading = document.querySelector('#view-produksi-kanban h2');
+                if (heading) heading.textContent = 'Laporan Defect Produksi';
+                const description = document.querySelector('#view-produksi-kanban h2')?.nextElementSibling;
+                if (description) description.textContent = 'Pemantauan laporan defect dari tim produksi (akses baca saja).';
+            }
             switchTab(tabs[0].id);
         }
 
@@ -2923,6 +2953,7 @@
             if(appData.role === 'owner') { renderExpenses(); if (document.getElementById('view-gaji-karyawan') && !document.getElementById('view-gaji-karyawan').classList.contains('hidden')) renderPayroll(); }
             if(appData.role === 'cs' || appData.role === 'owner') renderCRM();
             if(appData.role === 'cs' || appData.role === 'owner') renderDesignCenter();
+            if(appData.role === 'cs') renderDefectTable();
         }
 
         function renderCSWorkspace() {
@@ -4797,13 +4828,21 @@
         function advanceOrderStatus(id, nextStage) { updateOrderStatus(id, nextStage); }
 
         async function updateOrderStatus(id, newStatus) {
-            const o = appData.orders.find(item => item.id === id);
-            if (o) {
-                const oldStatus = o.status;
+            const o = appData.orders.find(item => String(item.id) === String(id));
+            if (!o) return showToast('Order tidak ditemukan.', 'error');
+            const oldStatus = o.status;
+            try {
+                if (isCloudConfigured()) {
+                    if (!cloudSessionToken) throw new Error('Sesi cloud tidak tersedia. Silakan login kembali.');
+                    await cloudRequest('updateProductionStatus', { orderId:id, status:newStatus });
+                }
                 o.status = newStatus;
                 saveLocalState();
-                saveOrderToCloud(o);
-                showToast(`Status #${id} diperbarui ke ${newStatus}. Sinkronisasi berjalan di background.`, 'success');
+                renderAll();
+                showToast(`Status #${id} diperbarui ke ${newStatus}.`, 'success');
+            } catch (err) {
+                o.status = oldStatus;
+                showToast('Status order gagal diperbarui: ' + err.message, 'error');
             }
         }
 
@@ -4841,6 +4880,7 @@
 
         async function handleSaveDefect(e) {
             e.preventDefault();
+            if (!['owner','produksi'].includes(String(appData.role || '').toLowerCase())) return showToast('CS/Admin hanya dapat melihat laporan defect.', 'error');
             const newDefect = {
                 orderId: document.getElementById('def-order').value,
                 date: new Date().toISOString().slice(0, 10),
@@ -4892,6 +4932,10 @@
                 `;
             });
 
+            renderDefectTable();
+        }
+
+        function renderDefectTable() {
             const defectBody = document.getElementById('defect-table-body');
             if (defectBody) {
                 defectBody.innerHTML = '';
@@ -4911,7 +4955,11 @@
             }
         }
 
-        function openAddStockModal(category) {
+        function openAddStockModal(category, stockId = null) {
+            const form = document.querySelector('#modalStock form');
+            if (form) form.reset();
+            document.getElementById('stk-id').value = '';
+            const existing = stockId ? appData.stock.find(x => String(x.id) === String(stockId)) : null;
             const typeInput = document.getElementById('stk-type');
             const titleEl = document.getElementById('modal-stock-title');
             const headerEl = document.getElementById('modal-stock-header');
@@ -4935,6 +4983,18 @@
                 document.getElementById('stk-name').placeholder = "misal: Plastisol Super White";
                 submitBtn.className = "px-4 py-2 bg-purple-600 text-white rounded font-semibold w-full";
             }
+            if (existing) {
+                typeInput.value = existing.type || category;
+                document.getElementById('stk-id').value = existing.id;
+                document.getElementById('stk-name').value = existing.name || '';
+                document.getElementById('stk-qty').value = Number(existing.qty || 0);
+                document.getElementById('stk-unit').value = existing.unit || '';
+                titleEl.innerHTML = 'Perbarui Stok';
+                submitBtn.textContent = 'Simpan Perubahan';
+            } else {
+                titleEl.innerHTML = category === 'Kain' ? '<i class="fa-solid fa-scroll mr-2"></i> Input Stok Kain' : '<i class="fa-solid fa-paint-roller mr-2"></i> Input Stok Cat/Tinta';
+                submitBtn.textContent = 'Simpan Stok';
+            }
             openModal('modalStock');
         }
 
@@ -4947,20 +5007,22 @@
 
             appData.stock.forEach(s => {
                 const isKain = (s.type === 'Kain');
+                const canManageStock = ['owner','produksi'].includes(String(appData.role || '').toLowerCase());
                 const html = `
-                    <div class="flex justify-between items-center p-3 bg-slate-50 rounded-xl border border-slate-200 hover:border-slate-300 transition">
-                        <div class="flex items-center space-x-3">
-                            <div class="w-8 h-8 ${isKain ? 'bg-sky-100 text-sky-600' : 'bg-purple-100 text-purple-600'} rounded-lg flex items-center justify-center font-bold text-xs">
+                    <div class="flex justify-between items-center gap-3 p-3 bg-slate-50 rounded-xl border border-slate-200 hover:border-slate-300 transition">
+                        <div class="flex items-center space-x-3 min-w-0">
+                            <div class="w-8 h-8 shrink-0 ${isKain ? 'bg-sky-100 text-sky-600' : 'bg-purple-100 text-purple-600'} rounded-lg flex items-center justify-center font-bold text-xs">
                                 <i class="fa-solid ${isKain ? 'fa-scroll' : 'fa-paint-roller'}"></i>
                             </div>
-                            <div>
+                            <div class="min-w-0">
                                 <span class="font-bold text-xs text-slate-800 block">${s.name}</span>
                                 <span class="text-[10px] text-slate-400">ID: ${s.id}</span>
                             </div>
                         </div>
-                        <div class="text-right">
+                        <div class="text-right shrink-0">
                             <span class="font-extrabold text-sm ${s.qty < 10 ? 'text-rose-600' : 'text-slate-800'}">${s.qty} <span class="text-[10px] font-normal">${s.unit}</span></span>
                             ${s.qty < 10 ? '<span class="text-[9px] text-rose-500 block font-bold"><i class="fa-solid fa-triangle-exclamation"></i> Menipis!</span>' : ''}
+                            ${canManageStock ? `<button type="button" onclick="openAddStockModal('${isKain ? 'Kain' : 'Cat'}','${String(s.id).replace(/'/g, '')}')" class="mt-1 text-[10px] font-bold text-blue-700 hover:underline">Edit stok</button>` : ''}
                         </div>
                     </div>
                 `;
@@ -4971,20 +5033,26 @@
 
         async function handleSaveStock(e) {
             e.preventDefault();
+            if (!['owner','produksi'].includes(String(appData.role || '').toLowerCase())) return showToast('Akses pengelolaan stok tidak diizinkan.', 'error');
             const category = document.getElementById('stk-type').value;
+            const existingId = document.getElementById('stk-id').value;
+            const existing = existingId ? appData.stock.find(x => String(x.id) === String(existingId)) : null;
             const newStk = {
-                id: 'STK-' + (appData.stock.length + 1),
+                ...(existing || {}),
+                id: existingId || ('STK-' + Date.now()),
                 type: category,
-                name: document.getElementById('stk-name').value,
+                name: document.getElementById('stk-name').value.trim(),
                 qty: Number(document.getElementById('stk-qty').value || 0),
-                unit: document.getElementById('stk-unit').value
+                unit: document.getElementById('stk-unit').value.trim()
             };
             try {
                 await saveStockToCloud(newStk);
-                appData.stock.push(newStk);
+                if (existing) appData.stock = appData.stock.map(x => String(x.id) === String(existingId) ? newStk : x);
+                else appData.stock.push(newStk);
                 saveLocalState();
+                renderStock();
                 closeModal('modalStock');
-                showToast(`Stok ${category} berhasil disimpan!`, 'success');
+                showToast(`Stok ${category} berhasil ${existing ? 'diperbarui' : 'ditambahkan'}!`, 'success');
             } catch (err) {
                 showToast('Stok gagal disimpan ke cloud: ' + err.message, 'error');
             }
