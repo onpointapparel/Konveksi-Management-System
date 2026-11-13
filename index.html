@@ -1059,6 +1059,50 @@
                     </form>
                 </div>
             </div>
+
+            <!-- MODAL KUOTA AKUN HABIS -->
+            <div id="modal-quota-exceeded" class="fixed inset-0 z-[90] hidden items-center justify-center bg-slate-950/70 backdrop-blur-sm p-4" role="dialog" aria-modal="true" aria-labelledby="quota-modal-title">
+                <div class="w-full max-w-md overflow-hidden rounded-3xl bg-white shadow-2xl">
+                    <div class="bg-gradient-to-br from-amber-500 via-orange-500 to-rose-500 px-6 py-7 text-center text-white">
+                        <div class="mx-auto mb-3 flex h-16 w-16 items-center justify-center rounded-2xl bg-white/20 text-3xl shadow-inner">
+                            <i class="fa-solid fa-users"></i>
+                        </div>
+                        <h3 id="quota-modal-title" class="text-xl font-extrabold">Kuota Akun Anda Telah Penuh!</h3>
+                        <p id="quota-modal-subtitle" class="mt-2 text-sm text-white/90">Kapasitas akun untuk jenis pengguna ini sudah mencapai batas.</p>
+                    </div>
+                    <div class="space-y-4 p-6">
+                        <div class="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                            <div class="mb-3 flex items-center justify-between gap-3">
+                                <span class="text-sm font-semibold text-slate-600">Jenis akun</span>
+                                <span id="quota-role-label" class="rounded-full bg-blue-100 px-3 py-1 text-xs font-extrabold text-blue-700">CS / Admin</span>
+                            </div>
+                            <div class="grid grid-cols-3 gap-2 text-center">
+                                <div class="rounded-xl bg-white p-3">
+                                    <div id="quota-limit-value" class="text-xl font-extrabold text-slate-800">1</div>
+                                    <div class="mt-1 text-[10px] font-semibold uppercase tracking-wide text-slate-400">Kuota</div>
+                                </div>
+                                <div class="rounded-xl bg-white p-3">
+                                    <div id="quota-used-value" class="text-xl font-extrabold text-rose-600">1</div>
+                                    <div class="mt-1 text-[10px] font-semibold uppercase tracking-wide text-slate-400">Terpakai</div>
+                                </div>
+                                <div class="rounded-xl bg-white p-3">
+                                    <div id="quota-remaining-value" class="text-xl font-extrabold text-emerald-600">0</div>
+                                    <div class="mt-1 text-[10px] font-semibold uppercase tracking-wide text-slate-400">Tersisa</div>
+                                </div>
+                            </div>
+                        </div>
+                        <p class="text-center text-sm leading-relaxed text-slate-600">Untuk menambahkan akun baru, Anda perlu membeli kapasitas tambahan. Akun yang dinonaktifkan tidak menggunakan kuota aktif.</p>
+                        <div class="space-y-2 pt-1">
+                            <button type="button" onclick="handleQuotaPurchase()" class="w-full rounded-xl bg-blue-600 px-4 py-3.5 text-sm font-extrabold text-white shadow-lg shadow-blue-600/20 transition hover:bg-blue-700">
+                                <i class="fa-solid fa-cart-shopping mr-2"></i>BELI TAMBAHAN KUOTA
+                            </button>
+                            <button type="button" onclick="closeQuotaExceededModal()" class="w-full rounded-xl border border-slate-200 px-4 py-3 text-sm font-bold text-slate-600 transition hover:bg-slate-50">
+                                NANTI SAJA
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
 </main>
     </div>
 </div>
@@ -2873,14 +2917,83 @@
             }).join('');
         }
 
+        function buildUserAdminError(message, code = '', quota = null) {
+            const err = new Error(message || 'Operasi pengguna gagal.');
+            err.code = code || '';
+            err.quota = quota || null;
+            return err;
+        }
+
+        async function readFunctionErrorPayload(error) {
+            const response = error?.context;
+            if (!response || typeof response.clone !== 'function') return null;
+            try {
+                return await response.clone().json();
+            } catch (_) {
+                return null;
+            }
+        }
+
         async function callUserAdmin(action, payload = {}) {
             if (appData.role !== 'owner') throw new Error('Hanya Owner yang boleh mengelola pengguna.');
+
             const { data, error } = await supabaseClient.functions.invoke('kms-admin', {
                 body: { action, ...payload }
             });
-            if (error) throw sbError(error, 'Layanan Manajemen Pengguna gagal.');
-            if (!data?.ok) throw new Error(data?.error || 'Operasi pengguna gagal.');
+
+            if (error) {
+                const body = await readFunctionErrorPayload(error);
+                const code = body?.code || body?.error_code || body?.details?.code || '';
+                const quota = body?.quota || body?.details?.quota || body?.meta?.quota || null;
+                const message = body?.message || body?.error || error.message || 'Layanan Manajemen Pengguna gagal.';
+                throw buildUserAdminError(message, code, quota);
+            }
+
+            if (!data?.ok) {
+                const code = data?.code || data?.error_code || data?.details?.code || '';
+                const quota = data?.quota || data?.details?.quota || data?.meta?.quota || null;
+                throw buildUserAdminError(data?.message || data?.error || 'Operasi pengguna gagal.', code, quota);
+            }
+
             return data;
+        }
+
+        function showQuotaExceededModal(role, quota = null) {
+            const modal = document.getElementById('modal-quota-exceeded');
+            if (!modal) return;
+
+            const roleLabel = role === 'produksi' ? 'Produksi' : 'CS / Admin';
+            const safeNumber = value => {
+                const number = Number(value);
+                return Number.isFinite(number) && number >= 0 ? number : null;
+            };
+
+            // Backend quota payload contract: { role, limit, used, remaining }.
+            // Accept common aliases so the UI remains tolerant during API rollout.
+            const limit = safeNumber(quota?.limit ?? quota?.quota_limit ?? quota?.capacity);
+            const used = safeNumber(quota?.used ?? quota?.active_users ?? quota?.used_count);
+            const remaining = safeNumber(quota?.remaining ?? quota?.available ?? quota?.remaining_count);
+
+            document.getElementById('quota-role-label').textContent = roleLabel;
+            document.getElementById('quota-modal-subtitle').textContent =
+                `Kapasitas akun ${roleLabel} sudah mencapai batas yang tersedia.`;
+            document.getElementById('quota-limit-value').textContent = limit === null ? '—' : limit.toLocaleString('id-ID');
+            document.getElementById('quota-used-value').textContent = used === null ? '—' : used.toLocaleString('id-ID');
+            document.getElementById('quota-remaining-value').textContent = remaining === null ? '0' : remaining.toLocaleString('id-ID');
+
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        }
+
+        function closeQuotaExceededModal() {
+            const modal = document.getElementById('modal-quota-exceeded');
+            if (!modal) return;
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+        }
+
+        function handleQuotaPurchase() {
+            showToast('Fitur pembelian kuota sedang dipersiapkan.', 'info');
         }
 
         async function loadManagedUsers() {
@@ -2919,7 +3032,13 @@
                 closeModal('modal-user-create');
                 showToast('Akun pengguna berhasil dibuat.', 'success');
                 await loadManagedUsers();
-            } catch (err) { showToast('Gagal membuat akun: ' + err.message, 'error'); }
+            } catch (err) {
+                if (err?.code === 'QUOTA_EXCEEDED') {
+                    showQuotaExceededModal(payload.role, err.quota);
+                } else {
+                    showToast('Gagal membuat akun: ' + err.message, 'error');
+                }
+            }
             finally { btn.disabled = false; btn.textContent = 'Buat Akun'; }
         }
 
